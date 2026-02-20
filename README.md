@@ -24,3 +24,5 @@ concurrency  ops        failures   throughput/s   mean_ms    p50_ms     p95_ms  
 ```
 
 ![Chart showing quote generation serialization](./results-gcp/quote_serialization.svg)
+
+Basically this shows us that attestation generation takes around 39ms (which is longer than i expected). And it is highly serialized - two concurrent generations take almost exactly twice long as one generation.
