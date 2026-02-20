@@ -22,3 +22,5 @@ concurrency  ops        failures   throughput/s   mean_ms    p50_ms     p95_ms  
 64           12800      0          25.171         2473.967   3251.411   3598.749   3715.820   3935.253
 128          25600      0          24.769         5020.951   6807.242   7311.143   7586.950   7971.502
 ```
+
+![Chart showing quote generation serialization](./results-gcp/quote_serialization.svg)
