@@ -1,13 +1,25 @@
 use std::fs;
 
-use assert_cmd::cargo::cargo_bin_cmd;
+use assert_cmd::Command;
 
 #[test]
 fn benchmark_smoke_writes_csv() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let csv_path = tmp.path().join("smoke.csv");
 
-    cargo_bin_cmd!("dcap-generate-benchmark")
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root should exist");
+
+    Command::new("cargo")
+        .current_dir(workspace_root)
+        .args([
+            "run",
+            "-p",
+            "dcap-generate-benchmark",
+            "--",
+        ])
         .args([
             "--workload",
             "fs",

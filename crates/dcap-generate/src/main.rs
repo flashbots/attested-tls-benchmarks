@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
@@ -105,7 +105,10 @@ async fn main() {
         .unwrap_or_else(|| default_csv_path(&cli.results_dir));
     if let Some(parent) = csv_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!("failed to create csv parent dir {}: {err}", parent.display());
+            eprintln!(
+                "failed to create csv parent dir {}: {err}",
+                parent.display()
+            );
             std::process::exit(1);
         }
     }
@@ -281,7 +284,9 @@ async fn run_worker(
         let op_result = tokio::task::spawn_blocking(move || match workload {
             Workload::Fs => run_fs_operation(&tmp_base, &payload, worker_id, iter, &counter)
                 .map_err(WorkloadError::Fs),
-            Workload::Tdx => run_tdx_operation().map_err(WorkloadError::Tdx),
+            Workload::Tdx => {
+                run_tdx_operation(worker_id, iter, &counter).map_err(WorkloadError::Tdx)
+            }
         })
         .await
         .map_err(|err| WorkloadError::TaskJoin(err.to_string()))?;
@@ -336,10 +341,25 @@ fn run_fs_operation(
     Ok(())
 }
 
-/// Performs one TDX quote generation operation with fixed 64-byte zero input.
-fn run_tdx_operation() -> Result<(), QuoteGenerationError> {
-    let _quote = configfs_tsm::create_tdx_quote([0_u8; 64])?;
+/// Performs one TDX quote generation operation with a unique 64-byte input.
+fn run_tdx_operation(
+    worker_id: usize,
+    iter: u64,
+    counter: &Arc<AtomicU64>,
+) -> Result<(), QuoteGenerationError> {
+    let input = make_tdx_input(worker_id, iter, counter);
+    let _quote = configfs_tsm::create_tdx_quote(input)?;
     Ok(())
+}
+
+/// Builds a unique quote input to prevent concurrent input-name collisions in configfs-tsm.
+fn make_tdx_input(worker_id: usize, iter: u64, counter: &Arc<AtomicU64>) -> [u8; 64] {
+    let mut input = [0_u8; 64];
+    let unique = counter.fetch_add(1, AtomicOrdering::Relaxed);
+    input[0..8].copy_from_slice(&unique.to_le_bytes());
+    input[8..16].copy_from_slice(&(worker_id as u64).to_le_bytes());
+    input[16..24].copy_from_slice(&iter.to_le_bytes());
+    input
 }
 
 /// Calculates latency summary statistics from operation samples in milliseconds.
@@ -500,8 +520,10 @@ fn write_csv(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
-    use super::{Cli, Workload, calculate_latency_stats, percentile_nearest_rank};
+    use super::{calculate_latency_stats, make_tdx_input, percentile_nearest_rank, Cli, Workload};
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -534,5 +556,15 @@ mod tests {
 
         let fs = Cli::try_parse_from(["bin", "--workload", "fs"]).expect("fs should parse");
         assert_eq!(fs.workload, Workload::Fs);
+    }
+
+    #[test]
+    fn tdx_input_is_unique_per_call() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let first = make_tdx_input(0, 0, &counter);
+        let second = make_tdx_input(0, 0, &counter);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+        assert_eq!(second.len(), 64);
     }
 }
