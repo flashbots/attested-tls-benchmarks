@@ -28,7 +28,7 @@ concurrency  ops        failures   throughput/s   mean_ms    p50_ms     p95_ms  
 
 Basically this shows us that attestation generation takes around 39ms (which is longer than i expected). And it is highly serialized - two concurrent generations take almost exactly twice long as one generation.
 
-### DCAP Verification (offline test vectors)
+### DCAP Verification with cached collateral 
 
 Benchmark attestation verification with fixed local test data and a deterministic timestamp:
 
@@ -64,3 +64,15 @@ concurrency  ops        failures   throughput/s   mean_ms    p50_ms     p95_ms  
 ![Chart showing quote verification serialization](./results-verify-with-collateral/1771832655_872976764-verify_dcap.svg)
 
 With pre-loaded collateral, verification is fast (0.5ms) and can be parallelized - throughput saturates around ~15k ops/s at roughly 32 concurrency on my machine.
+
+### DCAP Verification using Intel PCS each time
+
+I didn't run the full benchmark as eventually i got a failed request, but here you can see that hitting the Intel PCS drastically slows things down, taking us over 1s.
+
+```
+concurrency  ops        failures   throughput/s   mean_ms    p50_ms     p95_ms     p99_ms     max_ms
+1            5          0          0.909          1100.140   1038.311   1342.526   1342.526   1342.526
+2            10         0          1.987          1004.059   951.845    1231.018   1231.018   1231.018
+4            20         0          4.646          838.423    823.966    903.055    913.111    913.111
+8            40         0          3.868          1015.033   839.536    1213.722   6394.085   6394.085
+```

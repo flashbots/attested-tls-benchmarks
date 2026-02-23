@@ -69,6 +69,9 @@ struct Cli {
     /// UNIX timestamp used by verification workload.
     #[arg(long, default_value_t = DEFAULT_VERIFY_NOW)]
     verify_now: u64,
+    /// For verify workload, fetch collateral from Intel PCS each operation instead of using local collateral JSON.
+    #[arg(long, default_value_t = false)]
+    verify_use_pcs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +96,7 @@ struct LatencyStats {
 #[derive(Debug, Clone)]
 struct VerifyInputs {
     quote_bytes: Vec<u8>,
-    collateral: QuoteCollateralV3,
+    collateral: Option<QuoteCollateralV3>,
     expected_input_data: [u8; 64],
     now: u64,
 }
@@ -436,7 +439,7 @@ fn run_verify_operation(
             quote_bytes,
             expected_input_data,
             None,
-            Some(collateral),
+            collateral,
             now,
             false,
         )
@@ -561,22 +564,36 @@ fn load_verify_inputs(cli: &Cli) -> Result<VerifyInputs, String> {
                 cli.verify_quote_path.display()
             )
         })?;
-    let collateral_bytes = read_bytes_with_workspace_fallback(&cli.verify_collateral_path)
-        .map_err(|err| {
-            format!(
-                "failed to read collateral {}: {err}",
-                cli.verify_collateral_path.display()
-            )
-        })?;
-    let collateral: QuoteCollateralV3 = serde_json::from_slice(&collateral_bytes)
-        .map_err(|err| format!("failed to parse collateral JSON: {err}"))?;
+    let collateral = if cli.verify_use_pcs {
+        None
+    } else {
+        let collateral_bytes = read_bytes_with_workspace_fallback(&cli.verify_collateral_path)
+            .map_err(|err| {
+                format!(
+                    "failed to read collateral {}: {err}",
+                    cli.verify_collateral_path.display()
+                )
+            })?;
+        let parsed: QuoteCollateralV3 = serde_json::from_slice(&collateral_bytes)
+            .map_err(|err| format!("failed to parse collateral JSON: {err}"))?;
+        Some(parsed)
+    };
     let expected_input_data = parse_expected_input_hex(&cli.expected_input_hex)?;
+
+    let now = if cli.verify_use_pcs {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("failed to read system time: {err}"))?
+            .as_secs()
+    } else {
+        cli.verify_now
+    };
 
     Ok(VerifyInputs {
         quote_bytes,
         collateral,
         expected_input_data,
-        now: cli.verify_now,
+        now,
     })
 }
 
