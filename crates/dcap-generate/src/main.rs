@@ -2,14 +2,25 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use attested_tls::attestation::dcap::{
+    DcapVerificationError, verify_dcap_attestation_with_given_timestamp,
+};
 use clap::{Parser, ValueEnum};
 use configfs_tsm::QuoteGenerationError;
+use dcap_qvl::QuoteCollateralV3;
+use tokio::runtime::Handle;
 
 const DEFAULT_CONCURRENCY: &str = "1,2,4,8,16,32,64,128";
+const DEFAULT_VERIFY_QUOTE_PATH: &str =
+    "crates/dcap-generate/test-data/dcap-tdx-1766059550570652607";
+const DEFAULT_VERIFY_COLLATERAL_PATH: &str =
+    "crates/dcap-generate/test-data/dcap-quote-collateral-00.json";
+const DEFAULT_EXPECTED_INPUT_HEX: &str = "74276a648f1fd491f474a2d52c72d850e3768157b43ec297a9917482bd77278ba1882588391d1956b6f6466ad8b8dccd55f57221ad81b420f746fa8db0f8637d";
+const DEFAULT_VERIFY_NOW: u64 = 1_769_509_141;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum Workload {
@@ -17,6 +28,8 @@ enum Workload {
     Tdx,
     /// Benchmark filesystem create/write/fsync/read/delete operations.
     Fs,
+    /// Benchmark `attested_tls` DCAP verification using local quote/collateral test data.
+    Verify,
 }
 
 #[derive(Debug, Parser)]
@@ -41,9 +54,21 @@ struct Cli {
     /// Directory used for temporary benchmark files. Defaults to the system temp directory.
     #[arg(long)]
     tmp_dir: Option<PathBuf>,
-    /// Workload to benchmark: TDX quote generation or filesystem baseline.
+    /// Workload to benchmark: TDX quote generation, filesystem baseline, or verification.
     #[arg(long, value_enum, default_value_t = Workload::Tdx)]
     workload: Workload,
+    /// Path to quote bytes used for verification workload.
+    #[arg(long, default_value = DEFAULT_VERIFY_QUOTE_PATH)]
+    verify_quote_path: PathBuf,
+    /// Path to quote collateral JSON used for verification workload.
+    #[arg(long, default_value = DEFAULT_VERIFY_COLLATERAL_PATH)]
+    verify_collateral_path: PathBuf,
+    /// Expected 64-byte quote report data as a hex string (128 hex chars).
+    #[arg(long, default_value = DEFAULT_EXPECTED_INPUT_HEX)]
+    expected_input_hex: String,
+    /// UNIX timestamp used by verification workload.
+    #[arg(long, default_value_t = DEFAULT_VERIFY_NOW)]
+    verify_now: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +90,20 @@ struct LatencyStats {
     max_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+struct VerifyInputs {
+    quote_bytes: Vec<u8>,
+    collateral: QuoteCollateralV3,
+    expected_input_data: [u8; 64],
+    now: u64,
+}
+
 #[derive(Debug)]
 enum WorkloadError {
     Fs(io::Error),
     Tdx(QuoteGenerationError),
+    Verify(DcapVerificationError),
+    VerifyConfig(String),
     TaskJoin(String),
 }
 
@@ -77,6 +112,10 @@ impl std::fmt::Display for WorkloadError {
         match self {
             WorkloadError::Fs(err) => write!(f, "filesystem operation failed: {err}"),
             WorkloadError::Tdx(err) => write!(f, "tdx quote generation failed: {err}"),
+            WorkloadError::Verify(err) => write!(f, "dcap verification failed: {err}"),
+            WorkloadError::VerifyConfig(err) => {
+                write!(f, "invalid verification configuration: {err}")
+            }
             WorkloadError::TaskJoin(err) => write!(f, "worker task failed: {err}"),
         }
     }
@@ -102,7 +141,7 @@ async fn main() {
     let csv_path = cli
         .csv_path
         .clone()
-        .unwrap_or_else(|| default_csv_path(&cli.results_dir));
+        .unwrap_or_else(|| default_csv_path(&cli.results_dir, cli.workload));
     if let Some(parent) = csv_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             eprintln!(
@@ -115,6 +154,16 @@ async fn main() {
 
     let payload = vec![0xAB_u8; cli.payload_bytes];
     let tmp_base = cli.tmp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    let verify_inputs = match cli.workload {
+        Workload::Verify => match load_verify_inputs(&cli) {
+            Ok(inputs) => Some(Arc::new(inputs)),
+            Err(err) => {
+                eprintln!("failed to initialize verification inputs: {err}");
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
 
     let mut all_results = Vec::with_capacity(cli.concurrency.len());
     for &concurrency in &cli.concurrency {
@@ -124,6 +173,7 @@ async fn main() {
             &payload,
             &tmp_base,
             cli.workload,
+            verify_inputs.clone(),
         )
         .await
         {
@@ -176,13 +226,17 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     if cli.payload_bytes == 0 {
         return Err("payload-bytes must be > 0".to_owned());
     }
+    if cli.workload == Workload::Verify {
+        parse_expected_input_hex(&cli.expected_input_hex)
+            .map_err(|err| format!("--expected-input-hex {err}"))?;
+    }
     Ok(())
 }
 
 /// Builds the default timestamped CSV output path under the results directory.
-fn default_csv_path(results_dir: &Path) -> PathBuf {
+fn default_csv_path(results_dir: &Path, workload: Workload) -> PathBuf {
     let ts = unix_timestamp_string().replace('.', "_");
-    results_dir.join(format!("{ts}-fs-baseline.csv"))
+    results_dir.join(format!("{ts}-{}.csv", benchmark_name(workload)))
 }
 
 /// Returns the current UNIX timestamp as a string with subsecond precision.
@@ -200,6 +254,7 @@ async fn run_level(
     payload: &[u8],
     tmp_base: &Path,
     workload: Workload,
+    verify_inputs: Option<Arc<VerifyInputs>>,
 ) -> Result<LevelResult, WorkloadError> {
     let counter = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(concurrency);
@@ -209,6 +264,7 @@ async fn run_level(
         let counter = Arc::clone(&counter);
         let payload = payload.to_vec();
         let tmp_base = tmp_base.to_path_buf();
+        let verify_inputs = verify_inputs.clone();
         handles.push(tokio::spawn(async move {
             run_worker(
                 worker_id,
@@ -217,6 +273,7 @@ async fn run_level(
                 tmp_base,
                 counter,
                 workload,
+                verify_inputs,
             )
             .await
         }));
@@ -271,21 +328,33 @@ async fn run_worker(
     tmp_base: PathBuf,
     counter: Arc<AtomicU64>,
     workload: Workload,
+    verify_inputs: Option<Arc<VerifyInputs>>,
 ) -> Result<WorkerResult, WorkloadError> {
     let mut successes = 0_u64;
     let mut failures = 0_u64;
     let mut latencies_ms = Vec::with_capacity(iters_per_worker as usize);
+    let runtime_handle = Handle::current();
 
     for iter in 0..iters_per_worker {
         let payload = payload.clone();
         let tmp_base = tmp_base.clone();
         let counter = Arc::clone(&counter);
+        let verify_inputs = verify_inputs.clone();
+        let runtime_handle = runtime_handle.clone();
         let op_start = Instant::now();
         let op_result = tokio::task::spawn_blocking(move || match workload {
             Workload::Fs => run_fs_operation(&tmp_base, &payload, worker_id, iter, &counter)
                 .map_err(WorkloadError::Fs),
             Workload::Tdx => {
                 run_tdx_operation(worker_id, iter, &counter).map_err(WorkloadError::Tdx)
+            }
+            Workload::Verify => {
+                let verify_inputs = verify_inputs.ok_or_else(|| {
+                    WorkloadError::VerifyConfig(
+                        "verification workload selected but verify inputs missing".to_owned(),
+                    )
+                })?;
+                run_verify_operation(&runtime_handle, &verify_inputs).map_err(WorkloadError::Verify)
             }
         })
         .await
@@ -297,7 +366,7 @@ async fn run_worker(
                 latencies_ms.push(op_start.elapsed().as_secs_f64() * 1_000.0);
             }
             Err(err) => {
-                if workload == Workload::Tdx {
+                if matches!(workload, Workload::Tdx | Workload::Verify) {
                     return Err(err);
                 }
                 failures += 1;
@@ -350,6 +419,30 @@ fn run_tdx_operation(
     let input = make_tdx_input(worker_id, iter, counter);
     let _quote = configfs_tsm::create_tdx_quote(input)?;
     Ok(())
+}
+
+/// Performs one DCAP verification operation using preloaded test data.
+fn run_verify_operation(
+    runtime_handle: &Handle,
+    verify_inputs: &VerifyInputs,
+) -> Result<(), DcapVerificationError> {
+    let quote_bytes = verify_inputs.quote_bytes.clone();
+    let collateral = verify_inputs.collateral.clone();
+    let expected_input_data = verify_inputs.expected_input_data;
+    let now = verify_inputs.now;
+
+    runtime_handle.block_on(async move {
+        verify_dcap_attestation_with_given_timestamp(
+            quote_bytes,
+            expected_input_data,
+            None,
+            Some(collateral),
+            now,
+            false,
+        )
+        .await
+        .map(|_| ())
+    })
 }
 
 /// Builds a unique quote input to prevent concurrent input-name collisions in configfs-tsm.
@@ -446,6 +539,7 @@ fn workload_name(workload: Workload) -> &'static str {
     match workload {
         Workload::Tdx => "tdx",
         Workload::Fs => "fs",
+        Workload::Verify => "verify",
     }
 }
 
@@ -454,7 +548,75 @@ fn benchmark_name(workload: Workload) -> &'static str {
     match workload {
         Workload::Tdx => "tdx_quote",
         Workload::Fs => "fs_baseline",
+        Workload::Verify => "verify_dcap",
     }
+}
+
+/// Loads and validates static verification inputs from the configured CLI paths.
+fn load_verify_inputs(cli: &Cli) -> Result<VerifyInputs, String> {
+    let quote_bytes =
+        read_bytes_with_workspace_fallback(&cli.verify_quote_path).map_err(|err| {
+            format!(
+                "failed to read quote {}: {err}",
+                cli.verify_quote_path.display()
+            )
+        })?;
+    let collateral_bytes = read_bytes_with_workspace_fallback(&cli.verify_collateral_path)
+        .map_err(|err| {
+            format!(
+                "failed to read collateral {}: {err}",
+                cli.verify_collateral_path.display()
+            )
+        })?;
+    let collateral: QuoteCollateralV3 = serde_json::from_slice(&collateral_bytes)
+        .map_err(|err| format!("failed to parse collateral JSON: {err}"))?;
+    let expected_input_data = parse_expected_input_hex(&cli.expected_input_hex)?;
+
+    Ok(VerifyInputs {
+        quote_bytes,
+        collateral,
+        expected_input_data,
+        now: cli.verify_now,
+    })
+}
+
+/// Reads bytes from the given path, with a workspace-root fallback for default relative paths.
+fn read_bytes_with_workspace_fallback(path: &Path) -> io::Result<Vec<u8>> {
+    if path.exists() || path.is_absolute() {
+        return fs::read(path);
+    }
+
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workspace root not found"))?;
+    fs::read(workspace_root.join(path))
+}
+
+/// Parses a 64-byte hex string into an array for quote report-data comparison.
+fn parse_expected_input_hex(value: &str) -> Result<[u8; 64], String> {
+    if value.len() != 128 {
+        return Err(format!(
+            "must be exactly 128 hex chars (got {})",
+            value.len()
+        ));
+    }
+    if !value
+        .as_bytes()
+        .chunks_exact(2)
+        .all(|pair| pair.iter().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err("must contain only hex characters".to_owned());
+    }
+
+    let mut out = [0_u8; 64];
+    for (idx, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let hex_pair =
+            std::str::from_utf8(pair).map_err(|_| "contains invalid UTF-8".to_owned())?;
+        out[idx] = u8::from_str_radix(hex_pair, 16)
+            .map_err(|err| format!("contains invalid hex: {err}"))?;
+    }
+    Ok(out)
 }
 
 /// Writes benchmark results to CSV using one row per concurrency level.
@@ -520,10 +682,13 @@ fn write_csv(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
-    use super::{calculate_latency_stats, make_tdx_input, percentile_nearest_rank, Cli, Workload};
+    use super::{
+        Cli, Workload, calculate_latency_stats, make_tdx_input, parse_expected_input_hex,
+        percentile_nearest_rank,
+    };
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -556,6 +721,31 @@ mod tests {
 
         let fs = Cli::try_parse_from(["bin", "--workload", "fs"]).expect("fs should parse");
         assert_eq!(fs.workload, Workload::Fs);
+
+        let verify =
+            Cli::try_parse_from(["bin", "--workload", "verify"]).expect("verify should parse");
+        assert_eq!(verify.workload, Workload::Verify);
+    }
+
+    #[test]
+    fn parse_expected_input_hex_accepts_valid_input() {
+        let parsed = parse_expected_input_hex(super::DEFAULT_EXPECTED_INPUT_HEX)
+            .expect("default expected input should parse");
+        assert_eq!(parsed.len(), 64);
+    }
+
+    #[test]
+    fn parse_expected_input_hex_rejects_wrong_length() {
+        let err = parse_expected_input_hex("abcd").expect_err("short input should fail");
+        assert!(err.contains("128"));
+    }
+
+    #[test]
+    fn parse_expected_input_hex_rejects_non_hex() {
+        let mut invalid = "00".repeat(64);
+        invalid.replace_range(0..2, "zz");
+        let err = parse_expected_input_hex(&invalid).expect_err("non-hex should fail");
+        assert!(err.contains("hex"));
     }
 
     #[test]

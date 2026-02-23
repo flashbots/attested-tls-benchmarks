@@ -7,6 +7,10 @@ edition = "2024"
 clap = { version = "4.5.31", features = ["derive"] }
 configfs-tsm = "0.0.2"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+attested-tls = { git="https://github.com/flashbots/attested-tls-proxy.git" }
+dcap-qvl = { git = "https://github.com/flashbots/dcap-qvl.git", branch = "peg/azure-outdated-tcp-override" }
+serde_json = "1.0.145"
+openssl = { version = "0.10.75", features = ["vendored"] }
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
