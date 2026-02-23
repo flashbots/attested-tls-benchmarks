@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/dcap-generate"]
+members = ["crates/dcap-generate", "crates/nested-tls"]
 resolver = "3"
