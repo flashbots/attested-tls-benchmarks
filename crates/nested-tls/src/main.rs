@@ -23,6 +23,7 @@ const DEFAULT_MODES: &str = "single-tls,nested-tls";
 const DEFAULT_PAYLOAD_SIZES: &str = "65536,1048576,16777216";
 const DEFAULT_CHUNK_BYTES: usize = 16384;
 const DEFAULT_ROUNDS: u64 = 10;
+const DEFAULT_CONCURRENCY: usize = 1;
 const DEFAULT_SERVER_IP: &str = "127.0.0.1";
 const DEFAULT_RESULTS_DIR: &str = "results";
 const ROUND_TIMEOUT_SECS: u64 = 30;
@@ -49,6 +50,9 @@ struct Cli {
     /// Number of rounds per mode/payload row.
     #[arg(long, default_value_t = DEFAULT_ROUNDS)]
     rounds: u64,
+    /// Number of parallel connections per round.
+    #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
+    concurrency: usize,
     /// Directory for timestamped CSV output when --csv-path is not provided.
     #[arg(long, default_value = DEFAULT_RESULTS_DIR)]
     results_dir: PathBuf,
@@ -58,6 +62,9 @@ struct Cli {
     /// Server bind/listen IP for benchmark rounds.
     #[arg(long, default_value = DEFAULT_SERVER_IP)]
     server_ip: IpAddr,
+    /// Optional interface to sample wire byte/packet counters from (for example `lo` or `eth0`).
+    #[arg(long)]
+    netdev: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,12 +79,22 @@ struct RowResult {
     mode: Mode,
     payload_bytes: usize,
     chunk_bytes: usize,
+    concurrency: usize,
     rounds: u64,
     success_rounds: u64,
     failures: u64,
     total_bytes: u64,
     wall_time: Duration,
     stats: Option<Stats>,
+    cpu_user_ms: Option<f64>,
+    cpu_system_ms: Option<f64>,
+    cpu_total_ms: Option<f64>,
+    cpu_ms_per_mib: Option<f64>,
+    wire_tx_bytes: Option<u64>,
+    wire_rx_bytes: Option<u64>,
+    wire_tx_packets: Option<u64>,
+    wire_rx_packets: Option<u64>,
+    wire_bytes_per_app_byte: Option<f64>,
     overhead_vs_single_pct: Option<f64>,
 }
 
@@ -102,6 +119,20 @@ impl From<io::Error> for BenchError {
     fn from(value: io::Error) -> Self {
         BenchError::Io(value)
     }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct CpuTimes {
+    user_ms: f64,
+    system_ms: f64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct NetCounters {
+    tx_bytes: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    rx_packets: u64,
 }
 
 /// Helper to generate a self-signed certificate for testing.
@@ -241,6 +272,9 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     if cli.rounds == 0 {
         return Err("rounds must be > 0".to_owned());
     }
+    if cli.concurrency == 0 {
+        return Err("concurrency must be > 0".to_owned());
+    }
     Ok(())
 }
 
@@ -262,8 +296,25 @@ async fn run_row(
     payload_bytes: usize,
     tls: &TlsMaterials,
 ) -> Result<RowResult, BenchError> {
+    let cpu_before = cpu_times()?;
+    let net_before = if let Some(netdev) = &cli.netdev {
+        match read_netdev_counters(netdev) {
+            Ok(counters) => Some(counters),
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read netdev counters for {} (before row): {err}",
+                    netdev
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut failures = 0_u64;
     let mut successes = 0_u64;
+    let mut last_round_error: Option<String> = None;
     let mut per_round_throughput = Vec::with_capacity(cli.rounds as usize);
     let mut total_bytes = 0_u64;
     let row_start = Instant::now();
@@ -271,16 +322,26 @@ async fn run_row(
     for _ in 0..cli.rounds {
         match timeout(
             Duration::from_secs(ROUND_TIMEOUT_SECS),
-            run_one_round(mode, cli.server_ip, payload_bytes, cli.chunk_bytes, tls),
+            run_one_round(
+                mode,
+                cli.server_ip,
+                payload_bytes,
+                cli.chunk_bytes,
+                cli.concurrency,
+                tls,
+            ),
         )
         .await
         {
             Ok(Ok(throughput_bytes_per_sec)) => {
                 per_round_throughput.push(throughput_bytes_per_sec);
                 successes += 1;
-                total_bytes += payload_bytes as u64;
+                total_bytes += payload_bytes as u64 * cli.concurrency as u64;
             }
-            Ok(Err(_)) => failures += 1,
+            Ok(Err(err)) => {
+                failures += 1;
+                last_round_error = Some(err.to_string());
+            }
             Err(_) => {
                 return Err(BenchError::Timeout(format!(
                     "round exceeded {ROUND_TIMEOUT_SECS}s timeout"
@@ -289,19 +350,74 @@ async fn run_row(
         }
     }
 
+    if successes == 0 && failures > 0 {
+        return Err(BenchError::Protocol(format!(
+            "all rounds failed (mode={}, payload_bytes={}): {}",
+            mode_name(mode),
+            payload_bytes,
+            last_round_error.unwrap_or_else(|| "unknown round error".to_owned())
+        )));
+    }
+
     let wall_time = row_start.elapsed();
     let stats = calculate_stats(&per_round_throughput);
+    let cpu_after = cpu_times()?;
+    let cpu_user_ms = Some((cpu_after.user_ms - cpu_before.user_ms).max(0.0));
+    let cpu_system_ms = Some((cpu_after.system_ms - cpu_before.system_ms).max(0.0));
+    let cpu_total_ms = Some(cpu_user_ms.unwrap_or(0.0) + cpu_system_ms.unwrap_or(0.0));
+    let cpu_ms_per_mib = if total_bytes > 0 {
+        Some(cpu_total_ms.unwrap_or(0.0) / (total_bytes as f64 / (1024.0 * 1024.0)))
+    } else {
+        None
+    };
+
+    let (wire_tx_bytes, wire_rx_bytes, wire_tx_packets, wire_rx_packets, wire_bytes_per_app_byte) =
+        if let (Some(netdev), Some(before)) = (&cli.netdev, net_before) {
+            match read_netdev_counters(netdev) {
+                Ok(after) => {
+                    let tx = after.tx_bytes.saturating_sub(before.tx_bytes);
+                    let rx = after.rx_bytes.saturating_sub(before.rx_bytes);
+                    let tx_pkts = after.tx_packets.saturating_sub(before.tx_packets);
+                    let rx_pkts = after.rx_packets.saturating_sub(before.rx_packets);
+                    let ratio = if total_bytes > 0 {
+                        Some((tx + rx) as f64 / total_bytes as f64)
+                    } else {
+                        None
+                    };
+                    (Some(tx), Some(rx), Some(tx_pkts), Some(rx_pkts), ratio)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to read netdev counters for {} (after row): {err}",
+                        netdev
+                    );
+                    (None, None, None, None, None)
+                }
+            }
+        } else {
+            (None, None, None, None, None)
+        };
 
     Ok(RowResult {
         mode,
         payload_bytes,
         chunk_bytes: cli.chunk_bytes,
+        concurrency: cli.concurrency,
         rounds: cli.rounds,
         success_rounds: successes,
         failures,
         total_bytes,
         wall_time,
         stats,
+        cpu_user_ms,
+        cpu_system_ms,
+        cpu_total_ms,
+        cpu_ms_per_mib,
+        wire_tx_bytes,
+        wire_rx_bytes,
+        wire_tx_packets,
+        wire_rx_packets,
+        wire_bytes_per_app_byte,
         overhead_vs_single_pct: None,
     })
 }
@@ -311,8 +427,47 @@ async fn run_one_round(
     server_ip: IpAddr,
     payload_bytes: usize,
     chunk_bytes: usize,
+    concurrency: usize,
     tls: &TlsMaterials,
 ) -> Result<f64, BenchError> {
+    let round_start = Instant::now();
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let tls = tls.clone();
+        handles.push(tokio::spawn(run_one_connection(
+            mode,
+            server_ip,
+            payload_bytes,
+            chunk_bytes,
+            tls,
+        )));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                return Err(BenchError::Protocol(format!(
+                    "connection task join error: {err}"
+                )));
+            }
+        }
+    }
+
+    let elapsed = round_start.elapsed();
+    let total_payload_bytes = payload_bytes as f64 * concurrency as f64;
+    let throughput = total_payload_bytes / elapsed.as_secs_f64();
+    Ok(throughput)
+}
+
+async fn run_one_connection(
+    mode: Mode,
+    server_ip: IpAddr,
+    payload_bytes: usize,
+    chunk_bytes: usize,
+    tls: TlsMaterials,
+) -> Result<(), BenchError> {
     let listener = TcpListener::bind((server_ip, 0)).await?;
     let server_addr = listener.local_addr()?;
     let server_name = ServerName::try_from(server_addr.ip())
@@ -326,39 +481,37 @@ async fn run_one_round(
         match server_mode {
             Mode::SingleTls => {
                 let mut stream = outer_acceptor.accept(tcp_stream).await?;
-                drain_exact_bytes(&mut stream, payload_bytes).await
+                drain_exact_bytes(&mut stream, payload_bytes).await?;
+                send_ack(&mut stream).await
             }
             Mode::NestedTls => {
                 let outer_stream = outer_acceptor.accept(tcp_stream).await?;
                 let mut inner_stream = inner_acceptor.accept(outer_stream).await?;
-                drain_exact_bytes(&mut inner_stream, payload_bytes).await
+                drain_exact_bytes(&mut inner_stream, payload_bytes).await?;
+                send_ack(&mut inner_stream).await
             }
         }
     });
 
     let outer_connector = tls.outer_connector.clone();
     let inner_connector = tls.inner_connector.clone();
-    let round_start = Instant::now();
-
     let tcp_stream = TcpStream::connect(server_addr).await?;
     match mode {
         Mode::SingleTls => {
             let mut stream = outer_connector.connect(server_name.clone(), tcp_stream).await?;
             write_exact_bytes(&mut stream, payload_bytes, chunk_bytes).await?;
+            expect_ack(&mut stream).await?;
         }
         Mode::NestedTls => {
             let outer_stream = outer_connector.connect(server_name.clone(), tcp_stream).await?;
             let mut inner_stream = inner_connector.connect(server_name, outer_stream).await?;
             write_exact_bytes(&mut inner_stream, payload_bytes, chunk_bytes).await?;
+            expect_ack(&mut inner_stream).await?;
         }
     }
 
     match server_task.await {
-        Ok(Ok(())) => {
-            let elapsed = round_start.elapsed();
-            let throughput = payload_bytes as f64 / elapsed.as_secs_f64();
-            Ok(throughput)
-        }
+        Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(BenchError::Io(err)),
         Err(err) => Err(BenchError::Protocol(format!(
             "server task join error: {err}"
@@ -383,7 +536,6 @@ where
         remaining -= to_write;
     }
     stream.flush().await?;
-    stream.shutdown().await?;
     Ok(())
 }
 
@@ -404,6 +556,29 @@ where
             ));
         }
         remaining -= n;
+    }
+    Ok(())
+}
+
+async fn send_ack<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&[0xA5]).await?;
+    stream.flush().await
+}
+
+async fn expect_ack<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut ack = [0_u8; 1];
+    stream.read_exact(&mut ack).await?;
+    if ack[0] != 0xA5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected ack byte: {}", ack[0]),
+        ));
     }
     Ok(())
 }
@@ -433,11 +608,11 @@ fn percentile_nearest_rank(sorted_samples: &[f64], percentile: usize) -> f64 {
 }
 
 fn compute_overheads(rows: &mut [RowResult]) {
-    let mut single_by_payload: HashMap<usize, f64> = HashMap::new();
+    let mut single_by_payload: HashMap<(usize, usize), f64> = HashMap::new();
     for row in rows.iter() {
         if row.mode == Mode::SingleTls {
             if let Some(stats) = &row.stats {
-                single_by_payload.insert(row.payload_bytes, stats.mean);
+                single_by_payload.insert((row.payload_bytes, row.concurrency), stats.mean);
             }
         }
     }
@@ -450,7 +625,7 @@ fn compute_overheads(rows: &mut [RowResult]) {
             row.overhead_vs_single_pct = None;
             continue;
         };
-        let Some(single_mean) = single_by_payload.get(&row.payload_bytes) else {
+        let Some(single_mean) = single_by_payload.get(&(row.payload_bytes, row.concurrency)) else {
             row.overhead_vs_single_pct = None;
             continue;
         };
@@ -471,41 +646,48 @@ fn mode_name(mode: Mode) -> &'static str {
 
 fn print_table(rows: &[RowResult]) {
     println!(
-        "{:<12} {:<12} {:<12} {:<8} {:<8} {:<14} {:<14} {:<14} {:<12}",
+        "{:<12} {:<12} {:<12} {:<12} {:<8} {:<8} {:<12} {:<10} {:<10} {:<12}",
         "mode",
         "payload_bytes",
         "chunk_bytes",
+        "concurrency",
         "rounds",
         "fail",
-        "mean_Bps",
-        "p50_Bps",
-        "p95_Bps",
+        "mean_MiB/s",
+        "cpu_ms/MiB",
+        "wire/app",
         "overhead_%"
     );
 
     for row in rows {
-        let (mean, p50, p95) = match &row.stats {
-            Some(stats) => (
-                format!("{:.3}", stats.mean),
-                format!("{:.3}", stats.p50),
-                format!("{:.3}", stats.p95),
-            ),
-            None => ("NaN".to_owned(), "NaN".to_owned(), "NaN".to_owned()),
-        };
+        let mean_mib_s = row
+            .stats
+            .as_ref()
+            .map(|stats| format!("{:.3}", stats.mean / (1024.0 * 1024.0)))
+            .unwrap_or_else(|| "NaN".to_owned());
+        let cpu_per_mib = row
+            .cpu_ms_per_mib
+            .map(|v| format!("{:.3}", v))
+            .unwrap_or_else(|| "NaN".to_owned());
+        let wire_per_app = row
+            .wire_bytes_per_app_byte
+            .map(|v| format!("{:.3}", v))
+            .unwrap_or_else(|| "NaN".to_owned());
         let overhead = row
             .overhead_vs_single_pct
             .map(|v| format!("{:.3}", v))
             .unwrap_or_else(|| "NaN".to_owned());
         println!(
-            "{:<12} {:<12} {:<12} {:<8} {:<8} {:<14} {:<14} {:<14} {:<12}",
+            "{:<12} {:<12} {:<12} {:<12} {:<8} {:<8} {:<12} {:<10} {:<10} {:<12}",
             mode_name(row.mode),
             row.payload_bytes,
             row.chunk_bytes,
+            row.concurrency,
             row.rounds,
             row.failures,
-            mean,
-            p50,
-            p95,
+            mean_mib_s,
+            cpu_per_mib,
+            wire_per_app,
             overhead
         );
     }
@@ -516,7 +698,7 @@ fn write_csv(csv_path: &Path, timestamp: &str, rows: &[RowResult]) -> io::Result
     let mut writer = BufWriter::new(file);
     writeln!(
         writer,
-        "timestamp,benchmark,mode,payload_bytes,chunk_bytes,rounds,success_rounds,failures,total_bytes,wall_time_ms,throughput_bytes_s_mean,throughput_mib_s_mean,throughput_bytes_s_p50,throughput_bytes_s_p95,overhead_vs_single_pct"
+        "timestamp,benchmark,mode,payload_bytes,chunk_bytes,concurrency,rounds,success_rounds,failures,total_bytes,wall_time_ms,throughput_bytes_s_mean,throughput_mib_s_mean,throughput_bytes_s_p50,throughput_bytes_s_p95,cpu_user_ms,cpu_system_ms,cpu_total_ms,cpu_ms_per_mib,wire_tx_bytes,wire_rx_bytes,wire_tx_packets,wire_rx_packets,wire_bytes_per_app_byte,overhead_vs_single_pct"
     )?;
 
     for row in rows {
@@ -526,13 +708,23 @@ fn write_csv(csv_path: &Path, timestamp: &str, rows: &[RowResult]) -> io::Result
         };
         let overhead = row.overhead_vs_single_pct.unwrap_or(f64::NAN);
         let mean_mib_s = mean / (1024.0 * 1024.0);
+        let cpu_user_ms = row.cpu_user_ms.unwrap_or(f64::NAN);
+        let cpu_system_ms = row.cpu_system_ms.unwrap_or(f64::NAN);
+        let cpu_total_ms = row.cpu_total_ms.unwrap_or(f64::NAN);
+        let cpu_ms_per_mib = row.cpu_ms_per_mib.unwrap_or(f64::NAN);
+        let wire_tx_bytes = row.wire_tx_bytes.unwrap_or(0);
+        let wire_rx_bytes = row.wire_rx_bytes.unwrap_or(0);
+        let wire_tx_packets = row.wire_tx_packets.unwrap_or(0);
+        let wire_rx_packets = row.wire_rx_packets.unwrap_or(0);
+        let wire_bytes_per_app_byte = row.wire_bytes_per_app_byte.unwrap_or(f64::NAN);
         writeln!(
             writer,
-            "{},tls_upload,{},{},{},{},{},{},{},{:.3},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            "{},tls_upload,{},{},{},{},{},{},{},{},{:.3},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.6},{:.6}",
             timestamp,
             mode_name(row.mode),
             row.payload_bytes,
             row.chunk_bytes,
+            row.concurrency,
             row.rounds,
             row.success_rounds,
             row.failures,
@@ -542,10 +734,55 @@ fn write_csv(csv_path: &Path, timestamp: &str, rows: &[RowResult]) -> io::Result
             mean_mib_s,
             p50,
             p95,
+            cpu_user_ms,
+            cpu_system_ms,
+            cpu_total_ms,
+            cpu_ms_per_mib,
+            wire_tx_bytes,
+            wire_rx_bytes,
+            wire_tx_packets,
+            wire_rx_packets,
+            wire_bytes_per_app_byte,
             overhead
         )?;
     }
     writer.flush()
+}
+
+fn cpu_times() -> io::Result<CpuTimes> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: We pass a valid pointer and immediately read the initialized value only on success.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getrusage succeeded and initialized `usage`.
+    let usage = unsafe { usage.assume_init() };
+    let user_ms =
+        usage.ru_utime.tv_sec as f64 * 1_000.0 + usage.ru_utime.tv_usec as f64 / 1_000.0;
+    let system_ms =
+        usage.ru_stime.tv_sec as f64 * 1_000.0 + usage.ru_stime.tv_usec as f64 / 1_000.0;
+    Ok(CpuTimes { user_ms, system_ms })
+}
+
+fn read_counter_value(path: &Path) -> io::Result<u64> {
+    let contents = fs::read_to_string(path)?;
+    contents
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn read_netdev_counters(netdev: &str) -> io::Result<NetCounters> {
+    let base = Path::new("/sys/class/net")
+        .join(netdev)
+        .join("statistics");
+    Ok(NetCounters {
+        tx_bytes: read_counter_value(&base.join("tx_bytes"))?,
+        rx_bytes: read_counter_value(&base.join("rx_bytes"))?,
+        tx_packets: read_counter_value(&base.join("tx_packets"))?,
+        rx_packets: read_counter_value(&base.join("rx_packets"))?,
+    })
 }
 
 #[cfg(test)]
@@ -579,10 +816,13 @@ mod tests {
             "single-tls,nested-tls",
             "--payload-sizes",
             "4096,8192",
+            "--concurrency",
+            "4",
         ])
         .expect("cli should parse");
         assert_eq!(cli.modes, vec![Mode::SingleTls, Mode::NestedTls]);
         assert_eq!(cli.payload_sizes, vec![4096, 8192]);
+        assert_eq!(cli.concurrency, 4);
     }
 
     #[test]
@@ -592,6 +832,7 @@ mod tests {
                 mode: Mode::SingleTls,
                 payload_bytes: 1024,
                 chunk_bytes: 512,
+                concurrency: 2,
                 rounds: 2,
                 success_rounds: 2,
                 failures: 0,
@@ -602,12 +843,22 @@ mod tests {
                     p50: 1000.0,
                     p95: 1000.0,
                 }),
+                cpu_user_ms: None,
+                cpu_system_ms: None,
+                cpu_total_ms: None,
+                cpu_ms_per_mib: None,
+                wire_tx_bytes: None,
+                wire_rx_bytes: None,
+                wire_tx_packets: None,
+                wire_rx_packets: None,
+                wire_bytes_per_app_byte: None,
                 overhead_vs_single_pct: None,
             },
             RowResult {
                 mode: Mode::NestedTls,
                 payload_bytes: 1024,
                 chunk_bytes: 512,
+                concurrency: 2,
                 rounds: 2,
                 success_rounds: 2,
                 failures: 0,
@@ -618,6 +869,15 @@ mod tests {
                     p50: 800.0,
                     p95: 800.0,
                 }),
+                cpu_user_ms: None,
+                cpu_system_ms: None,
+                cpu_total_ms: None,
+                cpu_ms_per_mib: None,
+                wire_tx_bytes: None,
+                wire_rx_bytes: None,
+                wire_tx_packets: None,
+                wire_rx_packets: None,
+                wire_bytes_per_app_byte: None,
                 overhead_vs_single_pct: None,
             },
         ];

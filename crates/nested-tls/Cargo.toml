@@ -8,6 +8,7 @@ tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "net", "i
 tokio-rustls = "0.26"
 rcgen = "0.13"
 clap = { version = "4.5.31", features = ["derive"] }
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"

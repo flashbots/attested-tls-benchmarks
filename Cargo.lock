@@ -2221,6 +2221,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "libc",
  "rcgen",
  "tempfile",
  "tokio",
